@@ -1,37 +1,30 @@
 #!/bin/bash
 
-# Configurações Gerais
 set -euo pipefail
 IFS=$'\n\t'
 
-# Configurações do Script
-readonly DAYS_VALID=365
-
-# Variáveis que serão definidas após a entrada do usuário
 CA_KEY=""
 CA_CERT=""
 CA_CN=""
 PASSWORD_CA=""
 
-# Função para verificar pré-requisitos
 check_prerequisites() {
     if ! command -v openssl &>/dev/null; then
-        echo "Error: OpenSSL is not installed. Please install it and try again." >&2
+        echo "[ERROR] OpenSSL is not installed. Please install it and try again." >&2
         exit 1
     fi
 
     if [ ! -w "$(pwd)" ]; then
-        echo "Error: Current directory is not writable. Check permissions and try again." >&2
+        echo "[ERROR] Current directory is not writable. Check permissions and try again." >&2
         exit 1
     fi
 }
 
-# Função para verificar erros
 check_error() {
     local status=$?
     local cmd="${BASH_COMMAND:-unknown}"
-    local custom_message="${1:-An error occurred.}"  # Mensagem opcional
-    local exit_code="${2:-1}"  # Código de saída opcional
+    local custom_message="${1:-An error occurred.}"
+    local exit_code="${2:-1}"
 
     if [ $status -ne 0 ]; then
         echo "[ERROR] $(date +"%Y-%m-%d %H:%M:%S") - $custom_message" >&2
@@ -40,29 +33,20 @@ check_error() {
     fi
 }
 
-# Função para proteger arquivos sensíveis
-secure_file() {
-    chmod 600 "$1"
-}
-
-# Função para solicitar e proteger a senha
 generate_password() {
-    echo
     PASSWORD=$(openssl rand -base64 32)
-    echo "[INFO] Password generated automatically: $PASSWORD"
+    echo "[INFO] Password generated automatically for the entity: $PASSWORD"
 }
 
-# Função para solicitar o nome da CA e CN
-get_ca_and_cn() {
-    # Solicitar nome da CA
+create_ca() {
     while true; do
         read -r -p "Enter the name for the Certificate Authority (CA): " CA_NAME
-        CA_NAME="${CA_NAME:-localhost}"  # Valor padrão: localhost
+        CA_NAME="${CA_NAME:-localhost}"
 
         if [[ -n "$CA_NAME" ]]; then
             break
         else
-            echo "CA name cannot be empty. Please enter a valid name."
+            echo "[WARNING] CA name cannot be empty. Please enter a valid name."
         fi
     done
 
@@ -73,12 +57,9 @@ get_ca_and_cn() {
     echo "[INFO] Using CA CN: $CA_CN"
     echo "[INFO] Using CA key file: $CA_KEY"
     echo "[INFO] Using CA certificate file: $CA_CERT"
-}
 
-create_ca() {
-    # Verificar se o arquivo de chave da CA já existe
     if [[ -f "$CA_KEY" || -f "$CA_CERT" ]]; then
-        echo "Warning: CA key or certificate already exists. These will be overwritten."
+        echo "[WARNING] CA key or certificate already exists. These will be overwritten."
         read -r -p "Do you want to continue? (y/n): " overwrite_choice
         if [[ ! "$overwrite_choice" =~ ^[Yy]$ ]]; then
             echo "[INFO] Aborting CA creation."
@@ -87,29 +68,29 @@ create_ca() {
     fi
 
     echo "[INFO] Generating CA key..."
-
     PASSWORD_CA=$(openssl rand -base64 32)
-    echo "[INFO] Password generated automatically: $PASSWORD_CA"
+    echo "[INFO] CA Password generated automatically: $PASSWORD_CA"
 
-    # Gerar a chave privada da CA com criptografia, protegendo com senha
-    openssl genpkey -algorithm RSA -out "$CA_KEY" -aes256 -pkeyopt rsa_keygen_bits:2048 -pass pass:"$PASSWORD_CA" < /dev/null > /dev/null 2>&1
-    check_error "Failed to generate CA key."
-    secure_file "$CA_KEY"  # Definir permissões para segurança
-    echo "[INFO] CA key generated successfully."
+    if openssl genpkey -algorithm RSA -out "$CA_KEY" -aes256 -pkeyopt rsa_keygen_bits:2048 -pass pass:"$PASSWORD_CA" < /dev/null > /dev/null 2>&1; then
+        chmod 600 "$CA_KEY"
+        echo "[INFO] CA key generated successfully."
+    else
+        echo "[ERROR] Failed to generate CA key."
+        return 1
+    fi
 
     echo "[INFO] Generating CA certificate..."
+    if openssl req -x509 -new -nodes -key "$CA_KEY" -sha256 -days 3650 -out "$CA_CERT" -subj "/CN=$CA_CN" -passin pass:"$PASSWORD_CA" < /dev/null > /dev/null 2>&1; then
+        chmod 644 "$CA_CERT"
+        echo "[INFO] CA certificate generated successfully."
+    else
+        echo "[ERROR] Failed to generate CA certificate."
+        return 1
+    fi
 
-    # Criar o certificado autoassinado da CA
-    openssl req -x509 -new -nodes -key "$CA_KEY" -sha256 -days "$DAYS_VALID" -out "$CA_CERT" -subj "/CN=$CA_CN" -passin pass:"$PASSWORD_CA" < /dev/null > /dev/null 2>&1
-    check_error "Failed to generate CA certificate."
-    secure_file "$CA_CERT"  # Definir permissões para segurança
-    echo "[INFO] CA certificate generated successfully."
-
-    # Confirmar sucesso
     echo "[INFO] CA key and certificate created successfully!"
 }
 
-# Função para criar arquivo de configuração SAN
 create_san_config() {
     local entity_dir=$1
     local entity_cn=$2
@@ -138,7 +119,6 @@ DNS.2 = localhost
 EOF
 }
 
-# Função para criar certificados
 create_certificate() {
     local entity_dir=$1
     local entity_key=$2
@@ -148,17 +128,12 @@ create_certificate() {
     local entity_cn=$6
     local entity_password=$7
 
-    # Verificar se o diretório já existe
-    if [ ! -d "$entity_dir" ]; then
-        mkdir -p "$entity_dir"
-    fi
-
+    mkdir -p "$entity_dir"
     echo "[INFO] Generating key for $entity_dir..."
     openssl genrsa -out "$entity_key" 2048
     check_error "Failed to generate key for $entity_dir."
-    secure_file "$entity_key"
+    chmod 600 "$entity_key"
 
-    # Criar a configuração SAN
     create_san_config "$entity_dir" "$entity_cn"
 
     echo "[INFO] Generating CSR for $entity_dir..."
@@ -166,41 +141,31 @@ create_certificate() {
     check_error "Failed to generate CSR for $entity_dir."
 
     echo "[INFO] Signing certificate for $entity_dir..."
-    openssl x509 -req -in "$entity_csr" -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial -out "$entity_cert" -days "$DAYS_VALID" -sha256 -extensions v3_req -extfile "$SAN_CONFIG" -passin pass:"$PASSWORD_CA"
+    openssl x509 -req -in "$entity_csr" -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial -out "$entity_cert" -days 365 -sha256 -extensions v3_req -extfile "$SAN_CONFIG" -passin pass:"$PASSWORD_CA"
     check_error "Failed to sign certificate for $entity_dir."
 
     echo "[INFO] Exporting $entity_dir certificate to PKCS#12..."
     openssl pkcs12 -export -out "$entity_pfx" -inkey "$entity_key" -in "$entity_cert" -password pass:"$entity_password"
     check_error "Failed to export $entity_dir certificate to PKCS#12."
-    secure_file "$entity_pfx"
+    chmod 600 "$entity_pfx"
 
-    # Clean up SAN config file
-    rm -f "$SAN_CONFIG"
-
-    # Remove the CSR file after signing
-    rm -f "$entity_csr"
-    echo "[INFO] CSR file for $entity_cn removed successfully."
+    rm -f "$SAN_CONFIG" "$entity_csr"
+    echo "[INFO] Temporary files for $entity_cn removed successfully."
 }
 
-# Execução do Script
 main() {
     check_prerequisites
 
     echo "[INFO] Starting certificate creation process..."
-
-    get_ca_and_cn
-
-    # Criar CA com CN customizado
     create_ca
 
     while true; do
-        read -r -sp "Do you want to add a certificate to the CA? (y/n): " ADD_CERT
+        read -r -p "Do you want to add a certificate to the CA? (y/n): " ADD_CERT
         if [[ "$ADD_CERT" != "y" ]]; then
             break
         fi
 
-        echo
-        read -r -sp "Enter the Common Name (CN) for the certificate: " ENTITY_CN
+        read -r -p "Enter the Common Name (CN) for the certificate: " ENTITY_CN
 
         ENTITY_DIR="certificates/$ENTITY_CN"
         ENTITY_KEY="$ENTITY_DIR/$ENTITY_CN.key"
@@ -209,18 +174,12 @@ main() {
         ENTITY_PFX="$ENTITY_DIR/$ENTITY_CN.pfx"
 
         generate_password
-
         create_certificate "$ENTITY_DIR" "$ENTITY_KEY" "$ENTITY_CSR" "$ENTITY_CERT" "$ENTITY_PFX" "$ENTITY_CN" "$PASSWORD"
 
         echo "[INFO] Certificate for $ENTITY_CN created successfully!"
     done
 
-    SRL_FILE="ca.$CA_CN.srl"
-    if [[ -f "$SRL_FILE" ]]; then
-        rm -f "$SRL_FILE"
-        echo
-    fi
-
+    rm -f "ca.$CA_CN.srl"
     echo "[INFO] Certificate creation process completed!"
 }
 
